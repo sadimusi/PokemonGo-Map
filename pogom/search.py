@@ -126,24 +126,45 @@ def search_overseer_thread(args, new_location_queue, pause_bit, encryption_lib_p
         t.start()
 
     # A place to track the current location
-    current_location = False
+    current_location = new_location_queue.get()
 
     # The real work starts here but will halt on pause_bit.set()
     while True:
 
         # paused; clear queue if needed, otherwise sleep and loop
         if pause_bit.is_set():
-            if not search_items_queue.empty():
-                try:
-                    while True:
-                        search_items_queue.get_nowait()
-                except Empty:
-                    pass
+            try:
+                while not search_items_queue.empty():
+                    search_items_queue.get_nowait()
+            except Empty:
+                pass
+
+            # Still process incoming location changes so the queue doesn't fill up
+            try:
+                while not new_location_queue.empty():
+                    current_location = new_location_queue.get_nowait()
+            except Empty:
+                pass
+
             time.sleep(1)
             continue
 
-        # If a new location has been passed to us, get the most recent one
-        if not new_location_queue.empty():
+        # If there are no search_items_queue either the loop has finished (or been
+        # cleared) -- either way, time to fill it back up
+        if search_items_queue.empty():
+            log.debug('Search queue empty, restarting loop')
+            for step, step_location in enumerate(generate_location_steps(current_location, args.step_limit), 1):
+                log.debug('Queueing step %d @ %f/%f/%f', step, step_location[0], step_location[1], step_location[2])
+                search_args = (step, step_location)
+                search_items_queue.put(search_args)
+
+        # Wait for location changes
+        try:
+            current_location = new_location_queue.get(timeout=args.area_rescan_delay)
+        except Empty:
+            continue
+        else:
+            # If a new location has been passed to us, get the most recent one
             log.info('New location caught, moving search grid')
             try:
                 while True:
@@ -158,20 +179,6 @@ def search_overseer_thread(args, new_location_queue, pause_bit, encryption_lib_p
                         search_items_queue.get_nowait()
                 except Empty:
                     pass
-
-        # If there are no search_items_queue either the loop has finished (or been
-        # cleared above) -- either way, time to fill it back up
-        if search_items_queue.empty():
-            log.debug('Search queue empty, restarting loop')
-            for step, step_location in enumerate(generate_location_steps(current_location, args.step_limit), 1):
-                log.debug('Queueing step %d @ %f/%f/%f', step, step_location[0], step_location[1], step_location[2])
-                search_args = (step, step_location)
-                search_items_queue.put(search_args)
-        # else:
-        #     log.info('Search queue processing, %d items left', search_items_queue.qsize())
-
-        # Now we just give a little pause here
-        time.sleep(1)
 
 
 def search_worker_thread(args, account, search_items_queue, parse_lock, encryption_lib_path):
@@ -194,8 +201,8 @@ def search_worker_thread(args, account, search_items_queue, parse_lock, encrypti
             if args.proxy:
                 api.set_proxy({'http': args.proxy, 'https': args.proxy})
 
-            # Get current time
-            loop_start_time = int(round(time.time() * 1000))
+            # Keep track of map requests
+            map_request_time = 0
 
             # The forever loop for the searches
             while True:
@@ -229,10 +236,22 @@ def search_worker_thread(args, account, search_items_queue, parse_lock, encrypti
                     # Ok, let's get started -- check our login status
                     check_login(args, account, api, step_location)
 
+                    # If the last map request was completed less than scan_delay
+                    # seconds ago, hang on until that delay is reached
+                    sleep_delay_remaining = map_request_time + args.scan_delay - time.time()
+                    if sleep_delay_remaining > 0:
+                        time.sleep(sleep_delay_remaining)
+                        check_login(args, account, api, step_location)
+
                     api.activate_signature(encryption_lib_path)
 
                     # Make the actual request (finally!)
                     response_dict = map_request(api, step_location)
+
+                    # Keep track of the time the request finished.
+                    # This might be a bit conservative, but we don't want to risk
+                    # getting empty results because of inconsistent request times.
+                    map_request_time = time.time()
 
                     # G'damnit, nothing back. Mark it up, sleep, carry on
                     if not response_dict:
@@ -252,14 +271,6 @@ def search_worker_thread(args, account, search_items_queue, parse_lock, encrypti
                             log.exception('Search step %s map parsing failed, retrying request in %g seconds', step, sleep_time)
                             failed_total += 1
                             time.sleep(sleep_time)
-
-                # If there's any time left between the start time and the time when we should be kicking off the next
-                # loop, hang out until its up.
-                sleep_delay_remaining = loop_start_time + (args.scan_delay * 1000) - int(round(time.time() * 1000))
-                if sleep_delay_remaining > 0:
-                    time.sleep(sleep_delay_remaining / 1000)
-
-                loop_start_time += args.scan_delay * 1000
 
         # catch any process exceptions, log them, and continue the thread
         except Exception as e:
