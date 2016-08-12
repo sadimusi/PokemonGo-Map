@@ -242,13 +242,6 @@ def search_worker_thread(args, account, search_items_queue, parse_lock, encrypti
                     # Ok, let's get started -- check our login status
                     check_login(args, account, api, step_location)
 
-                    # If the last map request was completed less than scan_delay
-                    # seconds ago, hang on until that delay is reached
-                    sleep_delay_remaining = map_request_time + args.scan_delay - time.time()
-                    if sleep_delay_remaining > 0:
-                        time.sleep(sleep_delay_remaining)
-                        check_login(args, account, api, step_location)
-
                     api.activate_signature(encryption_lib_path)
 
                     # Make the actual request (finally!)
@@ -277,6 +270,12 @@ def search_worker_thread(args, account, search_items_queue, parse_lock, encrypti
                             log.exception('Search step %s map parsing failed, retrying request in %g seconds', step, sleep_time)
                             failed_total += 1
                             time.sleep(sleep_time)
+
+                # If there's any time left between the start time and the time when we should be kicking off the next
+                # loop, hang out until its up.
+                sleep_delay_remaining = map_request_time + args.scan_delay - time.time()
+                if sleep_delay_remaining > 0:
+                    time.sleep(sleep_delay_remaining)
 
         # catch any process exceptions, log them, and continue the thread
         except Exception as e:
