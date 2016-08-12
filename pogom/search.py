@@ -106,6 +106,18 @@ def fake_search_loop():
         time.sleep(10)
 
 
+class WorkerStatus(object):
+    WORKING = 1
+    WAITING = 2
+    SLEEPING = 3
+
+    def __init__(self):
+        self.status = self.WAITING
+
+    def update(self, status):
+        self.status = status
+
+
 # The main search loop that keeps an eye on the over all process
 def search_overseer_thread(args, new_location_queue, pause_bit, encryption_lib_path):
 
@@ -116,12 +128,16 @@ def search_overseer_thread(args, new_location_queue, pause_bit, encryption_lib_p
 
     # Create a search_worker_thread per account
     log.info('Starting search worker threads')
+    worker_statuses = []
     for i, account in enumerate(args.accounts):
         log.debug('Starting search worker thread %d for user %s', i, account['username'])
+        status = WorkerStatus()
+        worker_statuses.append(status)
+
         t = Thread(target=search_worker_thread,
                    name='search_worker_{}'.format(i),
                    args=(args, account, search_items_queue, parse_lock,
-                         encryption_lib_path))
+                         encryption_lib_path, status))
         t.daemon = True
         t.start()
 
@@ -130,6 +146,12 @@ def search_overseer_thread(args, new_location_queue, pause_bit, encryption_lib_p
 
     # The real work starts here but will halt on pause_bit.set()
     while True:
+        # Show worker status summary
+        log.info("Worker status: %d%% working, %d%% waiting, %d%% sleeping" % (
+            sum(1 for status in worker_statuses if status.status == WorkerStatus.WORKING) * 100 / len(worker_statuses),
+            sum(1 for status in worker_statuses if status.status == WorkerStatus.WAITING) * 100 / len(worker_statuses),
+            sum(1 for status in worker_statuses if status.status == WorkerStatus.SLEEPING) * 100 / len(worker_statuses)
+        ))
 
         # paused; clear queue if needed, otherwise sleep and loop
         if pause_bit.is_set():
@@ -187,7 +209,7 @@ def search_overseer_thread(args, new_location_queue, pause_bit, encryption_lib_p
                     pass
 
 
-def search_worker_thread(args, account, search_items_queue, parse_lock, encryption_lib_path):
+def search_worker_thread(args, account, search_items_queue, parse_lock, encryption_lib_path, status):
 
     # If we have more than one account, stagger the logins such that they occur evenly over scan_delay
     if len(args.accounts) > 1:
@@ -212,9 +234,12 @@ def search_worker_thread(args, account, search_items_queue, parse_lock, encrypti
 
             # The forever loop for the searches
             while True:
+                status.update(WorkerStatus.WAITING)
 
                 # Grab the next thing to search (when available)
                 step, step_location = search_items_queue.get()
+
+                status.update(WorkerStatus.WORKING)
 
                 log.info('Search step %d beginning (queue size is %d)', step, search_items_queue.qsize())
 
@@ -269,12 +294,15 @@ def search_worker_thread(args, account, search_items_queue, parse_lock, encrypti
                     except KeyError:
                         log.exception('Search step %s map parsing failed, retrying request in %g seconds', step, sleep_time)
                         failed_total += 1
+                        status.update(WorkerStatus.SLEEPING)
                         time.sleep(sleep_time)
+                        status.update(WorkerStatus.WORKING)
 
                 # If there's any time left between the start time and the time when we should be kicking off the next
                 # loop, hang out until its up.
                 sleep_delay_remaining = map_request_time + args.scan_delay - time.time()
                 if sleep_delay_remaining > 0:
+                    status.update(WorkerStatus.SLEEPING)
                     time.sleep(sleep_delay_remaining)
 
         # catch any process exceptions, log them, and continue the thread
