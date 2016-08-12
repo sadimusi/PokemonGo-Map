@@ -157,10 +157,16 @@ def search_overseer_thread(args, new_location_queue, pause_bit, encryption_lib_p
                 log.debug('Queueing step %d @ %f/%f/%f', step, step_location[0], step_location[1], step_location[2])
                 search_args = (step, step_location)
                 search_items_queue.put(search_args)
+            rescan_delay = args.area_rescan_delay
+
+        # Otherwise the last search loop must have taken longer than area_rescan_delay and
+        # we only wait briefly before trying to fill the queue up again
+        else:
+            rescan_delay = 1
 
         # Wait for location changes
         try:
-            current_location = new_location_queue.get(timeout=args.area_rescan_delay)
+            current_location = new_location_queue.get(timeout=rescan_delay)
         except Empty:
             continue
         else:
